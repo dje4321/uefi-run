@@ -1,4 +1,4 @@
-use anyhow::{Error, Result};
+use anyhow::Result;
 
 mod args;
 pub use args::*;

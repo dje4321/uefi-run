@@ -1,7 +1,4 @@
-use super::*;
 use clap::Parser;
-use std::path::PathBuf;
-
 /// Command line arguments for uefi-run
 #[derive(Parser, Debug, Default, PartialEq)]
 #[clap(
@@ -18,43 +15,26 @@ pub struct Args {
     /// Path to qemu executable
     #[clap(long, short = 'q', default_value = "qemu-system-x86_64")]
     pub qemu_path: String,
-    /// Size of the image in MiB
-    #[clap(long, short = 's', default_value_t = 10)]
+    /// Size of the image in MB
+    #[clap(long, short = 's', default_value_t = 256)]
     pub size: u64,
-    /// Additional files to be added to the efi image
-    ///
-    /// Additional files to be added to the efi image. If no inner location is provided, it will
-    /// default to the root of the image with the same name as the provided file.
-    #[clap(long, short = 'f')]
-    pub add_file: Vec<String>,
+    /// Folder to include inside the efi image
+    /// 
+    /// Any changes made inside the image will be reflected back onto the host OS
+    /// allowing for persistant storage of files
+    ///  
+    /// Useful for debug logging and general UEFI file manipulation
+    #[clap(long, short = 'p')]
+    pub persistant_data: Option<String>,
     /// EFI Executable
     pub efi_exe: String,
-    /// Additional arguments for qemu
+    /// Additional arguments for qemu   
     pub qemu_args: Vec<String>,
     /// Load the application as a bootloader instead of in an EFI shell
     ///
     /// This effectively skips the 5 second startup delay.
     #[clap(long, short = 'd')]
     pub boot: bool,
-}
-
-impl Args {
-    /// Parse `--add-file` arguments into `(outer, inner)` tuples of `PathBuf`
-    pub fn parse_add_file_args(&self) -> impl Iterator<Item = Result<(PathBuf, PathBuf)>> + '_ {
-        self.add_file.iter().map(|file| {
-            // Split the argument to get the inner and outer files
-            file.split_once(':')
-                .map(|(x, y)| Ok((PathBuf::from(x), PathBuf::from(y))))
-                .unwrap_or_else(|| {
-                    let outer = PathBuf::from(&file);
-                    let inner = PathBuf::from(&file)
-                        .file_name()
-                        .ok_or_else(|| Error::msg("Invalid --add-file argument"))?
-                        .into();
-                    Ok((outer, inner))
-                })
-        })
-    }
 }
 
 #[cfg(test)]

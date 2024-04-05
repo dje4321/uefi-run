@@ -1,80 +1,250 @@
-use super::*;
-use std::ffi::OsStr;
-use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::{fs::File, path::{Path, PathBuf}, io::Write, io::Read};
+use anyhow::{Result};
 
-/// Default startup script that just runs `run.efi`
+use fatfs::Dir;
+
+/// Default startup script that just runs `BOOTX64.efi`
 pub const DEFAULT_STARTUP_NSH: &[u8] = include_bytes!("startup.nsh");
 
 /// Handle to a FAT filesystem used as an EFI partition
-pub struct EfiImage {
-    fs: fatfs::FileSystem<fs::File>,
+pub struct UEFIImage {
+    pub fs: fatfs::FileSystem<File>,
 }
 
-impl EfiImage {
-    /// Create a new image at the given path
-    pub fn new<P: AsRef<Path>>(path: P, size: u64) -> Result<Self> {
-        // Create regular file and truncate it to size.
+impl UEFIImage {
+    pub fn new<P: AsRef<Path> >(file: P, size: u64) -> UEFIImage {
+
         let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        file.set_len(size)?;
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .open(&file).expect("Failed to open temp file");
 
-        // Create FAT fs and open it
-        fatfs::format_volume(&file, fatfs::FormatVolumeOptions::new())?;
-        let fs = fatfs::FileSystem::new(file, fatfs::FsOptions::new())?;
+        file.set_len(size).expect("Unable to expand temp file");
 
-        Ok(Self { fs })
+        let label: [u8; 11] = ['B' as u8, 'O' as u8, 'O' as u8, 'T' as u8, 0, 0, 0, 0, 0, 0, 0];
+
+        fatfs::format_volume(
+            &file,
+            fatfs::FormatVolumeOptions
+                ::new()
+                .fat_type(fatfs::FatType::Fat32)
+                .volume_label(label) // BOOT
+        ).expect("Failed to format FAT Image");
+
+        let fs = fatfs::FileSystem::new(
+            file, 
+            fatfs::FsOptions::new()
+        ).expect("Failed to generate FAT Filesystem");
+
+        UEFIImage { 
+            fs,
+        }
     }
+    pub fn add_directory<P: AsRef<Path>>(&self, pers_data: P, fs_dir: Dir<File>) -> Result<()>{
+        let dir = std::fs::read_dir(pers_data)?;
 
-    /// Add file to the image
-    fn add_file<P: AsRef<Path>>(&mut self, path: P) -> Result<fatfs::File<'_, fs::File>> {
-        let path = path.as_ref();
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| Error::msg("Invalid path"))?
-            .to_str()
-            .ok_or_else(|| Error::msg("Invalid filename encoding"))?;
-        let mut dir = self.fs.root_dir();
-        if let Some(dir_path) = path.parent() {
-            for dir_path_component in dir_path.iter() {
-                if dir_path_component == OsStr::new(&std::path::MAIN_SEPARATOR.to_string()) {
-                    continue;
+        // Go over every file in the directory
+        for file in dir {
+            let file = file?;
+
+            let file_path = file.path().clone();
+            let file_name = file_path.file_name().expect("Failed to get file name");
+            let file_name = file_name.to_str().expect("Incompatible characters in file name");
+
+            // Check if the file is a directory
+            if file.file_type()?.is_dir() {
+                // Mirror folder onto the FAT FS
+                fs_dir.create_dir(file_name)?;
+
+                // Call AddDirectory recursively to set inner contents
+                self.add_directory(
+                    file.path(), 
+                    fs_dir.open_dir(file_name)?
+                )?;
+            }
+
+            if file.file_type()?.is_symlink() {
+                //Follow symlink and get the real file it points too. 
+                let real_file_path = std::fs::canonicalize(file.path());
+                if real_file_path.is_err() {
+                    panic!("Symlink Points to invalid file\r\nSymlink: {:?}", file_path)
                 }
-                let dir_path_component = dir_path_component
-                    .to_str()
-                    .ok_or_else(|| Error::msg("Cannot convert path to string"))?;
-                dir = dir.create_dir(dir_path_component)?;
+
+                // Mirror file onto the FAT FS
+                let mut fat_file = fs_dir.create_file(file_name)?;
+                
+                let file_contents = std::fs::read(&real_file_path.unwrap())?;
+                fat_file.write_all(&file_contents)?;
+            }
+
+            if file.file_type()?.is_file() {
+                // Mirror file onto the FAT FS
+                let mut fat_file = fs_dir.create_file(file_name)?;
+
+                let file_contents = std::fs::read(&file_path)?;
+                fat_file.write_all(&file_contents)?;
             }
         }
-        let mut file = dir.create_file(file_name)?;
-        file.truncate()?;
-        Ok(file)
+    
+        return Ok(());
     }
+    pub fn sync_directory<P: AsRef<Path> >(&self, pers_data: P, fs_dir: Dir<File>) -> Result<()> {
+        'file: for file in fs_dir.iter() {
+            let file = file.expect("Failed to get FAT file");
+            let filename = file.file_name();
 
-    /// Copy file from host filesystem to the image
-    pub fn copy_host_file<P1: AsRef<Path>, P2: AsRef<Path>>(
-        &mut self,
-        src: P1,
-        dst: P2,
-    ) -> Result<()> {
-        let file_contents = fs::read(src)?;
-        let mut file = self.add_file(dst)?;
-        file.write_all(&file_contents)?;
-        Ok(())
+            if filename == "." || filename == ".." || filename == "NvVars" || filename == "BootX64.efi" || filename == "startup.nsh"    {
+                continue 'file;
+            }
+
+            let mut file_path = PathBuf::new();
+            file_path.push(&pers_data);
+            file_path.push(&filename);
+
+            if file.is_dir() {
+                // Ensure directory exsists on host
+                let r_os_folder_md = std::fs::metadata(&file_path);
+                match r_os_folder_md {
+                    Ok(os_folder_md) => {
+                        // File exsists
+                        if !os_folder_md.is_dir() {
+                            panic!("File conflict found on host folder. Expected directory");
+                        }
+                    }
+                    Err(_) => {
+                        // File does not exsist
+                        std::fs::create_dir(&file_path)?;
+                    }
+                }
+
+                self.sync_directory(&file_path, fs_dir.open_dir(filename.as_str())?)?;                
+            }
+
+            if file.is_file() {
+                // Ensure file exsists on host
+                let r_os_file_md = std::fs::metadata(&file_path);
+                match r_os_file_md {
+                    Ok(os_file_md) => {
+
+                        if os_file_md.is_symlink() {
+                            // Do nothing on symlinks to prevent arbritary values from being written to any file on the FS
+                            println!("FatFS-Sync: {filename} is a Symlink. Skipping");
+                        }
+
+                        // File exsists
+                        if !os_file_md.is_file() {
+                            panic!("File conflict found on host folder. Expected File");
+                        }
+                    }
+                    Err(_) => {
+                        // File does not exsist
+                        ()
+                    }
+                }
+
+                let mut os_file = std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .append(false)
+                .create(true)
+                .open(file_path)
+                .expect("Failed to open file");
+
+                let mut data: Vec<u8> = Vec::new();
+                file.to_file().read_to_end(&mut data).expect("Failed to read FAT file data");
+
+                os_file.write_all(data.as_slice()).expect("Failed to write to OS file");
+            }
+        }
+        return Ok(());
     }
+    pub fn add_bootloader<P: AsRef<Path>>(&self, efi_exe: P) -> Result<()> {
+        let mut efi_exe = std::fs::OpenOptions::new()
+        .write(false)
+        .read(true)
+        .create(false)
+        .open(efi_exe).expect("Failed to open EFI Exe");
 
-    /// Write file contents
-    pub fn set_file_contents<P: AsRef<Path>, B: AsRef<[u8]>>(
-        &mut self,
-        path: P,
-        contents: B,
-    ) -> Result<()> {
-        let mut file = self.add_file(path)?;
-        file.write_all(contents.as_ref())?;
-        Ok(())
+        // Check for /EFI
+        let mut root_dir = self.fs.root_dir();
+        let result = root_dir.open_dir("EFI");
+        match result {
+            Ok(dir) => {
+                root_dir = dir;
+            }
+            Err(_) => {
+                // Failed to open directory. Assume it doesnt exsist
+                root_dir.create_dir("EFI")?;
+                root_dir = root_dir.open_dir("EFI")?;
+            }
+        }
+
+        // Check for /EFI/Boot/
+        let result = root_dir.open_dir("Boot");
+        match result {
+            Ok(dir) => {
+                root_dir = dir;
+            }
+            Err(_) => {
+                // Failed to open directory. Assume it doesnt exsist
+                root_dir.create_dir("Boot")?;
+                root_dir = root_dir.open_dir("Boot")?;
+            }
+        }
+
+        // Check for /EFI/Boot/BootX64.efi
+        let result = root_dir.open_file("BootX64.efi");
+        match result {
+            Ok(mut file) => {
+                let mut data: Vec<u8> = Vec::new();
+                efi_exe.read_to_end(&mut data)?;
+
+                file.write_all(&data)?;
+            }
+            Err(_) => {
+                // Failed to open file. Assume it doesnt exsist
+                let mut file = root_dir.create_file("BootX64.efi")?;
+                
+                let mut data: Vec<u8> = Vec::new();
+                efi_exe.read_to_end(&mut data)?;
+
+                file.write_all(&data)?;
+            }
+        }
+
+        return Ok(());
+    }
+    pub fn add_startup_script<P: AsRef<Path>>(&self, efi_exe: P) -> Result<()> {
+        let root_dir = self.fs.root_dir();
+        let mut startup = root_dir.create_file("startup.nsh")?;
+        startup.write_all(DEFAULT_STARTUP_NSH)?;
+
+        let mut efi_exe = std::fs::OpenOptions::new()
+        .write(false)
+        .read(true)
+        .create(false)
+        .open(efi_exe).expect("Failed to open EFI Exe");
+
+        let result = root_dir.open_file("BootX64.efi");
+        match result {
+            Ok(mut file) => {
+                let mut data: Vec<u8> = Vec::new();
+                efi_exe.read_to_end(&mut data)?;
+
+                file.write_all(&data)?;
+            }
+            Err(_) => {
+                // Failed to open file. Assume it doesnt exsist
+                let mut file = root_dir.create_file("BootX64.efi")?;
+                
+                let mut data: Vec<u8> = Vec::new();
+                efi_exe.read_to_end(&mut data)?;
+
+                file.write_all(&data)?;
+            }
+        }
+
+        return Ok(());
     }
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use uefi_run::*;
 
 fn main() {
-    // Parse command line
+    // Parse Arguments from CLAP
     let args = Args::parse();
 
     // Install termination signal handler. This ensures that the destructor of
@@ -23,47 +23,31 @@ fn main() {
         .expect("Error setting termination handler");
     }
 
-    // Create temporary dir for the image file.
-    let temp_dir = tempfile::tempdir().expect("Unable to create temporary directory");
-    let temp_dir_path = PathBuf::from(temp_dir.path());
+    // Get a temp file to store FatFS
+    let temp_folder = tempfile::tempdir().unwrap();
+    let temp_dir_path = temp_folder.path();
+    let mut tempfile = PathBuf::from(temp_dir_path);
+    tempfile.push("boot.img");
 
-    // Path to the image file
-    let image_file_path = {
-        let mut path_buf = temp_dir_path;
-        path_buf.push("image.fat");
-        path_buf
-    };
-
-    {
-        let mut image =
-            EfiImage::new(&image_file_path, args.size * 0x10_0000).expect("Failed to create image");
-
-        // Create EFI executable
-        if args.boot {
-            // Copy the application to where the firmware expects a bootloader.
-            image.copy_host_file(&args.efi_exe, "EFI/Boot/BootX64.efi")
-        } else {
-            // Use startup.nsh to start the application from the EFI shell.
-            image
-                .copy_host_file(&args.efi_exe, "run.efi")
-                .and_then(|_| image.set_file_contents("startup.nsh", DEFAULT_STARTUP_NSH))
-        }
-        .expect("Failed to copy EFI executable");
-
-        // Create user provided additional files
-        for (outer, inner) in args.parse_add_file_args().map(|x| x.unwrap()) {
-            // Copy the file into the image
-            image
-                .copy_host_file(outer, inner)
-                .expect("Failed to copy user-defined file");
-        }
+    // Setup a new UEFIImage
+    let image = UEFIImage::new(&tempfile, args.size * 1024 * 1024);
+    if let Some(data_folder) = &args.persistant_data {
+        image.add_directory(data_folder, image.fs.root_dir()).expect("Failed to add persistant data folder to image");
     }
 
+    if args.boot {
+        image.add_bootloader(args.efi_exe).expect("Failed to inject EFI Exe");
+    } else {
+        image.add_startup_script(args.efi_exe).expect("Failed to inject startup script");
+    }
+
+    // Run QEMU
+    let tempfile_path = tempfile.clone();
     let mut qemu_config = QemuConfig {
         qemu_path: args.qemu_path,
         bios_path: args.bios_path,
         drives: vec![QemuDriveConfig {
-            file: image_file_path.to_str().unwrap().to_string(),
+            file: tempfile_path.to_str().unwrap().to_string(),
             media: "disk".to_string(),
             format: "raw".to_string(),
         }],
@@ -103,6 +87,11 @@ fn main() {
             })
             .expect("Unable to kill qemu process");
         qemu_exit_code = qemu_process.wait(Duration::from_secs(1));
+    }
+
+    // Sync files back to host after QEMU exits
+    if let Some(data_folder) = &args.persistant_data {
+        image.sync_directory(data_folder, image.fs.root_dir()).expect("Failed to sync persistant data folder to host");
     }
 
     let exit_code = qemu_exit_code.expect("qemu should have exited by now but did not");
