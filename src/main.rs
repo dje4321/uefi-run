@@ -94,6 +94,8 @@ fn main() {
         image.sync_directory(data_folder, image.fs.root_dir()).expect("Failed to sync persistant data folder to host");
     }
 
+    std::fs::remove_file(tempfile).expect("Failed to cleanup FatFS Image");
+
     let exit_code = qemu_exit_code.expect("qemu should have exited by now but did not");
     std::process::exit(exit_code);
 }

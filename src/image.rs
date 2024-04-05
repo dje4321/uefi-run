@@ -1,4 +1,5 @@
-use std::{fs::File, path::{Path, PathBuf}, io::Write, io::Read};
+use core::panic;
+use std::{fs::File, path::{Path, PathBuf}, io::Write, io::Read, io::{Seek, SeekFrom}, println};
 use anyhow::{Result};
 
 use fatfs::Dir;
@@ -14,13 +15,24 @@ pub struct UEFIImage {
 impl UEFIImage {
     pub fn new<P: AsRef<Path> >(file: P, size: u64) -> UEFIImage {
 
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
         .write(true)
         .read(true)
-        .create_new(true)
+        .create(true)
         .open(&file).expect("Failed to open temp file");
 
-        file.set_len(size).expect("Unable to expand temp file");
+        file.set_len(size).expect("Failed to set length");
+
+        // Ensure we can reserve enough disk space for file image
+        let zero_buf = vec![0; 1024 * 1024];
+        for _ in 0..(size/1024/1024) {
+            let r = file.write(&zero_buf);
+            if r.is_err() {
+                panic!("Not enough disk space to allocate FAT FS");
+            }
+        }
+
+        file.seek(SeekFrom::Start(0)).expect("Failed to seek to start of file");
 
         let label: [u8; 11] = ['B' as u8, 'O' as u8, 'O' as u8, 'T' as u8, 0, 0, 0, 0, 0, 0, 0];
 
@@ -72,18 +84,18 @@ impl UEFIImage {
                 }
 
                 // Mirror file onto the FAT FS
-                let mut fat_file = fs_dir.create_file(file_name)?;
+                let mut fat_file = fs_dir.create_file(file_name).expect("Failed to create file on FatFS");
                 
                 let file_contents = std::fs::read(&real_file_path.unwrap())?;
-                fat_file.write_all(&file_contents)?;
+                fat_file.write_all(&file_contents).expect("Failed to write file to FatFS. Disk size too small");
             }
 
             if file.file_type()?.is_file() {
                 // Mirror file onto the FAT FS
-                let mut fat_file = fs_dir.create_file(file_name)?;
+                let mut fat_file = fs_dir.create_file(file_name).expect("Failed to create file on FatFS");
 
                 let file_contents = std::fs::read(&file_path)?;
-                fat_file.write_all(&file_contents)?;
+                fat_file.write_all(&file_contents).expect("Filed to write data to FAT FS. Disk size too small");
             }
         }
     
@@ -129,7 +141,7 @@ impl UEFIImage {
 
                         if os_file_md.is_symlink() {
                             // Do nothing on symlinks to prevent arbritary values from being written to any file on the FS
-                            println!("FatFS-Sync: {filename} is a Symlink. Skipping");
+                            println!("[SYNC]: {filename} is a Symlink. Skipping");
                         }
 
                         // File exsists
@@ -143,18 +155,23 @@ impl UEFIImage {
                     }
                 }
 
-                let mut os_file = std::fs::OpenOptions::new()
+                let os_file = std::fs::OpenOptions::new()
                 .write(true)
                 .read(true)
                 .append(false)
                 .create(true)
-                .open(file_path)
-                .expect("Failed to open file");
+                .open(&file_path);
+
+                if os_file.is_err() {
+                    println!("[SYNC] Skipping... Failed to open Host file {:?}", &file_path);
+
+                    continue 'file;
+                }
 
                 let mut data: Vec<u8> = Vec::new();
                 file.to_file().read_to_end(&mut data).expect("Failed to read FAT file data");
 
-                os_file.write_all(data.as_slice()).expect("Failed to write to OS file");
+                os_file.unwrap().write_all(data.as_slice()).expect("Failed to write to OS file");
             }
         }
         return Ok(());
